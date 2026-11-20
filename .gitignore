@@ -1,0 +1,8 @@
+build/
+.DS_Store
+xcuserdata/
+*.xcodeproj/
+__pycache__/
+DemoKit/media/
+DemoKit/out/
+Config/Local.xcconfig

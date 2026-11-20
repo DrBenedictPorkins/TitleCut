@@ -1,0 +1,205 @@
+---
+title: "TitleCut demo kit"
+format: gfm
+---
+
+A talking-head video, a music bed, and two runs through every TitleCut
+feature: by hand in the app (Part A) and over MCP (Part B). Each step says
+what to do and what to check, so a full run is also an integration test.
+
+## Contents
+
+| Path | What |
+|---|---|
+| `media/speech.mp4` | 3 min 43 s, 1920x1080, one speaker, near-continuous speech |
+| `media/speech-nasa.srt` | NASA's own subtitles for it, the reference for checking Auto-Captions |
+| `media/music.m4a` | 66 s ambient bed, 96 BPM, AAC 48 kHz stereo |
+| `tools/make_music.py` | Regenerates `music.m4a` |
+| `tools/mcp_demo.py` | Part B as a script: drives every MCP tool and checks each result |
+| `out/` | What the runs write: export, subtitles, frame grabs |
+
+## Sources and rights
+
+**`speech.mp4`, `speech-nasa.srt`.** "Connecting Classrooms to Space: Ham
+Radio Explainer by NASA Astronaut Nichole Ayers", NASA Johnson Space Center,
+2025-12-16, NASA ID
+`jsc2025m000040_Connecting_Classrooms_to_Space-Ham_Radio_Explainer_by_NASA_Astronaut_Nichole_Ayers`,
+from images.nasa.gov (`~large.mp4` rendition).
+
+- NASA's media usage guidelines state that NASA video is generally not
+  subject to copyright in the United States.
+- Third-party material on NASA's site is marked with its copyright holder.
+  This item's metadata names none.
+- Conditions: credit NASA as the source, and do not imply NASA endorsement.
+  The guidelines also restrict using astronauts' likenesses in commercial
+  contexts. Keep this video to testing and demos; do not use it in
+  marketing.
+- The video opens on the ARISS (Amateur Radio on the International Space
+  Station) logo, which is that organisation's mark.
+
+**`music.m4a`.** Synthesised by `tools/make_music.py` from sine waves; no
+samples or third-party material. Regenerate with:
+
+```sh
+uv run --with numpy python -I DemoKit/tools/make_music.py /tmp/music.wav
+afconvert -f m4af -d aac -b 192000 /tmp/music.wav DemoKit/media/music.m4a
+```
+
+## Part A — by hand in the app
+
+Start from a new project (File > New). Times are on the timeline ruler.
+
+### 1. Open the video
+
+1. Click **Open Video…** (Shift-Command-O) and choose `media/speech.mp4`.
+2. **Check:** the preview shows the astronaut; the timeline holds one clip
+   with a waveform in its lower half; the shape picker offers 16:9, 9:16,
+   1:1 and Original.
+
+### 2. Remove silences
+
+1. Click **Remove Silences** in the timeline bar.
+2. Set **QUIETER THAN** to -15 DB and **LONGER THAN** to 0.3 S. This
+   speaker pauses briefly and softly; the default settings find almost
+   nothing. **Result** shows the cut count and seconds (about 60 pauses,
+   16 s).
+3. Click **REMOVE**.
+4. **Check:** the clip is now several clips and the total is shorter. Press
+   Command-Z: one clip again. Press Shift-Command-Z: the cuts return.
+
+### 3. Auto-captions
+
+1. Click **Auto-Captions**. Pick **Language** English (US) and a style;
+   click **START**.
+2. **Check:** captions appear along the video. The first caption after the
+   radio call-sign exchange reads close to "Hey everyone, I'm NASA astronaut
+   Nichole Ayers". Compare a few against `media/speech-nasa.srt`.
+3. Timeline > **Select All Captions** (Option-Command-A).
+4. **Check:** the inspector shows the captions as a group. Change
+   **HIGHLIGHT** to a new colour: every caption's spoken-word highlight
+   changes. Drag the duration slider: all captions scale together.
+5. File > **Export Subtitles…** and save `out/captions.srt`.
+
+### 4. A hook title
+
+1. Move the playhead to 0 s. Click **Title** in the timeline bar (or press T
+   with the preview focused).
+2. In the inspector, type `Ham radio` / `from orbit` on two lines; under
+   STYLES pick **Meme**.
+3. Under **FONT** raise the size; under **COLOUR** pick yellow; under
+   **OUTLINE** add a black outline; set **LANDING** to the top.
+4. **Check:** the preview shows the title as styled. Command-Z steps back one
+   change at a time.
+
+### 5. Titles on the timeline
+
+1. Select the hook title. Command-D duplicates it right after itself.
+2. Right-click it: **Copy**, then move the playhead and **Paste**.
+3. Select a copy and press Delete.
+4. **Check:** each action is one Edit-menu undo step with its own name.
+
+### 6. Cut the video
+
+1. Move the playhead to 40 s; Timeline > **Split at Playhead** (Command-K).
+   Split again at 50 s.
+2. Select the clip between them and press Delete.
+3. **Check:** later clips close up and their captions move with them.
+4. Drag the end of the last clip left by about 5 s.
+5. Drag a clip right along the timeline.
+6. **Check:** a gap (black) opens where it was; later clips are pushed right.
+   Undo the move.
+
+### 7. Timeline navigation
+
+1. Command-Plus, Command-Minus, Command-0 (zoom to fit).
+2. Hold Command over the timeline: the pointer shows zoom-in. Hold Shift:
+   it shows scroll arrows.
+3. Drag a clip towards the right edge: the timeline scrolls on its own.
+
+### 8. Vertical video
+
+1. In the top bar's shape picker choose **9:16**.
+2. **Check:** the frame is portrait, cropped at the centre. Select the clip:
+   the inspector's Screen section shows a map of the clip's whole width,
+   with the part in frame outlined and the rest dimmed.
+3. Drag the outline in the map left and right.
+4. **Check:** the preview follows the outline, for this clip only. Select
+   another clip: the map shows that clip at its own framing. Command-Z
+   undoes the whole drag as one step.
+5. Click the map away from the outline.
+6. **Check:** the outline centres on the click.
+7. Command-drag the preview left and right.
+8. **Check:** the picture slides the same way, and the map's outline
+   follows.
+9. Choose **Original**, then choose **9:16** again.
+
+### 9. Freeze frame and camera move
+
+1. Move the playhead to about 12 s. Click **Freeze**.
+2. **Check:** a 3-second still is inserted; everything after moves later.
+   With the playhead on the freeze, the mini-map is hidden.
+3. Drag the freeze's right edge to make it 4 s.
+4. Double-click the freeze (or **EDIT CAMERA…** in the FREEZE inspector).
+   Drag the box onto the astronaut's face; drag its corner dot to zoom;
+   pick a **Pace**; click **DONE**.
+5. **Check:** playing the freeze moves from the whole frame to the box.
+
+### 10. Background music
+
+1. Move the playhead to 0 s. Click **Music** and choose `media/music.m4a`.
+2. In the MUSIC inspector, lower the volume to about 25% and set a 2 s
+   fade-out.
+3. Right-click the piece and choose **Duplicate**.
+4. **Check:** the copy starts where the first ends. Trim its end by
+   dragging. Play across the join: speech stays clear over the bed.
+
+### 11. Export
+
+1. File > **Export MP4…** (Command-E). Pick **Codec** H.264; tick **Also
+   save subtitles (.srt) next to the video**; click **NEXT** and save as
+   `out/demo.mp4`.
+2. **Check:** the export finishes; `demo.mp4` plays in QuickTime in 9:16
+   with titles, captions, the freeze zoom and the music, and carries the
+   TitleCut watermark; `demo.srt` sits next to it.
+
+### 12. Save and reopen
+
+1. File > Save as `out/demo.titlecut`. Close it, then reopen it.
+2. **Check:** every edit is still there, including the music.
+
+## Part B — over MCP
+
+### Automatic
+
+With TitleCut running and the **MCP** button green, allow the demo kit's
+folder once: click **MCP**, then under **Folders** click **ADD FOLDER…** and
+choose `DemoKit`. TitleCut is sandboxed, so MCP can only open and save files
+in folders allowed there.
+
+```sh
+uv run python -I DemoKit/tools/mcp_demo.py
+```
+
+It opens a new project and runs 13 checked steps, from the `get_instructions`
+gate to the export. It prints PASS or FAIL per step and exits non-zero on any
+failure. Output goes to `out/`: `captions.srt`, `demo.mp4`, `demo.srt`,
+`01-hook.png`, `02-vertical.png`, `03-freeze-zoom.png`. The project is left
+open and unsaved.
+
+The captions step checks the transcript against NASA's subtitles and fails
+if fewer than 70% of NASA's words were heard.
+
+### From Claude Code
+
+In a Claude Code session with TitleCut registered (`/mcp` shows it), ask:
+
+> Open DemoKit/media/speech.mp4 in a new TitleCut project. Remove the
+> silences, add English auto-captions, put a "Ham radio from orbit" hook
+> title at the start in the Meme style, make it 9:16, freeze at 12 s and zoom
+> in on the speaker, add DemoKit/media/music.m4a at 25% volume, show me a
+> frame, then export to DemoKit/out/claude.mp4 with subtitles.
+
+Allow the `DemoKit` folder first, as above. **Check:** Claude calls
+`get_instructions` first, addresses the project by
+the ID from `list_projects`, polls `job_status` for both jobs, and the export
+matches what was asked.

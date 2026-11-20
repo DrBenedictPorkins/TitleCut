@@ -1,0 +1,38 @@
+{
+  "identifier" : "7B3E2C1A",
+  "nonRenewingSubscriptions" : [
+
+  ],
+  "products" : [
+    {
+      "displayPrice" : "2.99",
+      "familyShareable" : false,
+      "internalID" : "6740000001",
+      "localizations" : [
+        {
+          "description" : "Removes the TitleCut watermark from every export.",
+          "displayName" : "Remove Watermark",
+          "locale" : "en_US"
+        }
+      ],
+      "productID" : "com.byteclub.titlecut.unlock",
+      "referenceName" : "TitleCut Unlock",
+      "type" : "NonConsumable"
+    }
+  ],
+  "settings" : {
+    "_failTransactionsEnabled" : false,
+    "_locale" : "en_US",
+    "_storefront" : "USA",
+    "_storeKitErrors" : [
+
+    ]
+  },
+  "subscriptionGroups" : [
+
+  ],
+  "version" : {
+    "major" : 4,
+    "minor" : 0
+  }
+}

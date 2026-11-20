@@ -1,0 +1,158 @@
+name: TitleCut
+
+options:
+  bundleIdPrefix: com.byteclub.titlecut
+  deploymentTarget:
+    macOS: "26.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+
+settings:
+  base:
+    MARKETING_VERSION: 0.1.0
+    CURRENT_PROJECT_VERSION: 1
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    MACOSX_DEPLOYMENT_TARGET: "26.0"
+    # Sandboxed (App/TitleCut.entitlements), reversing D5. Release is
+    # ad-hoc signed, no team.
+    CODE_SIGN_STYLE: Manual
+    ENABLE_HARDENED_RUNTIME: NO
+
+# Signing identity and team come from Config/*.xcconfig. Debug also reads an
+# uncommitted Config/Local.xcconfig, so a personal Apple Development
+# certificate keeps the code identity stable across rebuilds.
+configFiles:
+  Debug: Config/Debug.xcconfig
+  Release: Config/Signing.xcconfig
+
+packages:
+  MCP:
+    url: https://github.com/modelcontextprotocol/swift-sdk
+    exactVersion: 0.12.1
+
+targets:
+  TitleCut:
+    type: application
+    platform: macOS
+    sources:
+      - path: App
+      - path: UI
+        excludes:
+          - "**/.gitkeep"
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleName: $(APP_DISPLAY_NAME)
+        CFBundleDisplayName: $(APP_DISPLAY_NAME)
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSApplicationCategoryType: public.app-category.video
+        NSPrincipalClass: NSApplication
+        TCBuildDate: TC_BUILD_DATE
+        NSSpeechRecognitionUsageDescription: >-
+          TitleCut transcribes your video's audio on this Mac to make captions.
+        NSMicrophoneUsageDescription: >-
+          TitleCut records your voice with the screen when you use Record Screen.
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: TitleCut Project
+            CFBundleTypeRole: Editor
+            LSHandlerRank: Owner
+            LSTypeIsPackage: true
+            LSItemContentTypes:
+              - com.byteclub.titlecut.project
+          # Lets the sandboxed app write the .srt beside an exported MP4.
+          - CFBundleTypeName: SubRip Subtitles
+            CFBundleTypeRole: None
+            LSHandlerRank: None
+            NSIsRelatedItemType: true
+            CFBundleTypeExtensions:
+              - srt
+        UTExportedTypeDeclarations:
+          - UTTypeIdentifier: com.byteclub.titlecut.project
+            UTTypeDescription: TitleCut Project
+            UTTypeConformsTo:
+              - com.apple.package
+              - public.composite-content
+            UTTypeTagSpecification:
+              public.filename-extension:
+                - titlecut
+    settings:
+      base:
+        PRODUCT_NAME: TitleCut
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+        INFOPLIST_PREPROCESS: YES
+        INFOPLIST_PREFIX_HEADER: $(DERIVED_FILE_DIR)/BuildDate.h
+        CODE_SIGN_ENTITLEMENTS: App/TitleCut.entitlements
+      configs:
+        Debug:
+          PRODUCT_BUNDLE_IDENTIFIER: com.byteclub.titlecut.dev
+          APP_DISPLAY_NAME: TitleCut Dev
+        Release:
+          PRODUCT_BUNDLE_IDENTIFIER: com.byteclub.titlecut
+          APP_DISPLAY_NAME: TitleCut
+    dependencies:
+      - target: TitleCutCore
+      - package: MCP
+        product: MCP
+    preBuildScripts:
+      - name: Generate Build Date
+        basedOnDependencyAnalysis: false
+        outputFiles:
+          - $(DERIVED_FILE_DIR)/BuildDate.h
+        script: |
+          # Prefix header for Info.plist preprocessing; fills TCBuildDate.
+          STAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          printf '#define TC_BUILD_DATE %s\n' "$STAMP" > "${DERIVED_FILE_DIR}/BuildDate.h"
+
+  TitleCutCore:
+    type: framework
+    platform: macOS
+    sources:
+      - path: Core
+        excludes:
+          - "**/.gitkeep"
+    settings:
+      base:
+        PRODUCT_NAME: TitleCutCore
+        PRODUCT_BUNDLE_IDENTIFIER: com.byteclub.titlecut.core
+        GENERATE_INFOPLIST_FILE: YES
+        DEFINES_MODULE: YES
+        SKIP_INSTALL: YES
+
+  CoreTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests/CoreTests
+    dependencies:
+      - target: TitleCutCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.byteclub.titlecut.coretests
+        GENERATE_INFOPLIST_FILE: YES
+
+fileGroups:
+  - StoreKit
+
+schemes:
+  TitleCut:
+    build:
+      targets:
+        TitleCut: all
+        TitleCutCore: all
+        CoreTests: [test]
+    run:
+      config: Debug
+      # Local purchase testing (Xcode Product > Run only).
+      storeKitConfiguration: StoreKit/TitleCut.storekit
+    test:
+      config: Debug
+      targets:
+        - CoreTests
+    profile:
+      config: Release
+    analyze:
+      config: Debug
+    archive:
+      config: Release

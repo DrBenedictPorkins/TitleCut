@@ -1,0 +1,855 @@
+---
+title: "TitleCut — Implementation Plan"
+date: 2026-10-07
+format: html
+---
+
+# 1. Purpose
+
+A native macOS app for one narrow job: take a video, scrub to points in it,
+and add timed, styled titles, still frames, and zooms on those stills. It
+exports a finished MP4. It is not a general video editor.
+
+Claude Code can drive the same project through an MCP server, live, while the
+app is open.
+
+## 1.1 In scope (v1)
+
+- Open one source video per project.
+- Scrub, play, frame-step, mark points.
+- Timeline of ordered segments: video ranges and still blocks.
+- Split a video segment at the playhead.
+- Grab the current frame as a still. Insert it as a still block for N seconds.
+- Zoom keyframes on still blocks (zoom to a point, pan, ease).
+- Titles: text, start, duration, style, in transition, out transition.
+- Style presets, chosen before or after a title is added.
+- Undo/redo for every edit, including edits made through MCP.
+- Save/load project. Export MP4.
+- Embedded MCP integration for Claude Code.
+
+## 1.2 Out of scope (v1)
+
+- Multiple source videos, multiple video tracks, picture-in-picture.
+- Audio editing beyond the rule in §6.4.
+- Transitions between segments (cross-dissolve etc.).
+- Zoom keyframes on video segments (the model allows it later; see §4.4).
+- Effects, colour grading, speed changes.
+- iOS / iPad.
+
+# 2. Platform and tooling
+
+| Item | Value |
+|---|---|
+| Language | Swift 6, strict concurrency |
+| UI | SwiftUI, AppKit only where SwiftUI cannot (timeline drag, key handling) |
+| Media | AVFoundation, Core Image, Core Text |
+| Min macOS | 26.0 (dev machine is 26.4.1, Xcode 26.5) |
+| Project generation | XcodeGen (`/opt/homebrew/bin/xcodegen`), `project.yml` is the source of truth |
+| Bundle ID | `com.byteclub.titlecut` |
+| MCP | `modelcontextprotocol/swift-sdk` via SPM |
+| Tests | Swift Testing (`@Test`), plus XCTest only where needed for performance |
+
+::: {.callout-note}
+The user handles all git operations.
+:::
+
+# 3. Architecture overview
+
+```
+┌──────────────────────────── TitleCut.app ─────────────────────────────┐
+│                                                                        │
+│  UI (SwiftUI)                         MCP server                       │
+│  Preview · Transport · Timeline ·     tools → same commands as UI      │
+│  Inspector · Style library                                             │
+│           │                                   │                        │
+│           └──────────────┬────────────────────┘                        │
+│                          ▼                                             │
+│              ProjectStore (@MainActor, @Observable)                    │
+│              owns Project value + UndoManager                          │
+│              every mutation = one ProjectCommand                       │
+│                          │                                             │
+│                          ▼                                             │
+│              CompositionBuilder (pure function)                        │
+│              Project → AVComposition + AVVideoComposition              │
+│                          │                                             │
+│           ┌──────────────┴──────────────┐                              │
+│           ▼                             ▼                              │
+│     AVPlayer (preview)           AVAssetExportSession (export)         │
+│           └──────────────┬──────────────┘                              │
+│                          ▼                                             │
+│              TitleCutCompositor (AVVideoCompositing)                   │
+│              draws video frame / still + zoom + titles                 │
+│              via FrameRenderer (Core Image), one code path             │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+## 3.1 Key principles
+
+1. **One renderer.** Preview and export go through the same custom compositor
+   and the same `FrameRenderer`. What you see is what exports.
+2. **One mutation path.** UI and MCP both call `ProjectStore` commands. Nothing
+   else mutates `Project`. Undo, autosave and UI refresh come for free for both.
+3. **Model is value types.** `Project` is a `struct`, `Codable`, `Sendable`.
+   Undo stores whole snapshots (projects are small; no diffing needed).
+4. **Composition is derived.** The AV composition is rebuilt from the model
+   after every change (debounced ~50 ms). It is never edited in place.
+
+## 3.2 Module layout
+
+Single app target, folders as logical modules. A separate framework target
+(`TitleCutCore`) holds everything without UI so tests do not need the app.
+
+```
+TitleCut/
+  project.yml
+  CLAUDE.md
+  PLAN.qmd
+  App/                    TitleCutApp, AppDelegate, menus, window
+  Core/                   → framework target TitleCutCore
+    Model/                Project, Segment, Title, Style, Keyframe, Time
+    Store/                ProjectStore, ProjectCommand, UndoSupport
+    Timeline/             TimelineMath (output time ↔ segment/source time)
+    Composition/          CompositionBuilder, instructions
+    Render/               TitleCutCompositor, FrameRenderer, TitleRenderer,
+                          StillRenderer, Easing, TransitionEvaluator
+    Stills/               FrameGrabber
+    Persistence/          ProjectFile (package read/write), StyleLibrary
+    Export/               Exporter
+  MCP/                    MCPServer, tool definitions, gate
+  UI/
+    Preview/              PlayerView (AVPlayerLayer host), overlay hit-testing
+    Transport/            play/pause, scrub bar, timecode, frame step
+    Timeline/             TimelineView, SegmentTrack, TitleTrack, Playhead
+    Inspector/            TitleInspector, StillInspector, SegmentInspector
+    Styles/               StylePicker, StyleEditor
+    Export/               ExportSheet
+  Tests/
+    CoreTests/
+    Fixtures/             generated test video (see §11.2)
+```
+
+# 4. Data model
+
+All times are stored as `Tick` = `Int64` at a fixed timescale of 600
+(divisible by 24, 25, 30, 60; matches `CMTime` convention). Converted to
+`CMTime(value:timescale:600)` at the AVFoundation boundary. No `Double`
+seconds in the model — avoids drift and float compare bugs.
+
+```swift
+struct Project: Codable, Sendable, Equatable {
+    var formatVersion: Int = 1
+    var source: SourceVideo
+    var segments: [Segment]          // played in order
+    var titles: [Title]
+    var styles: [TitleStyle]         // styles used by this project (embedded copies)
+    var stills: [StillImage]         // images captured into the package
+    var output: OutputSettings
+}
+
+struct SourceVideo: Codable, Sendable, Equatable {
+    var bookmark: Data               // file bookmark to the original video
+    var lastKnownPath: String
+    var duration: Tick
+    var naturalSize: CGSize
+    var frameRate: Double            // nominal, for frame-step
+}
+
+enum Segment: Codable, Sendable, Equatable, Identifiable {
+    case video(VideoSegment)
+    case still(StillSegment)
+}
+
+struct VideoSegment: Codable, Sendable, Equatable {
+    var id: UUID
+    var sourceRange: TickRange       // range in the source video
+}
+
+struct StillSegment: Codable, Sendable, Equatable {
+    var id: UUID
+    var stillID: UUID                // → Project.stills
+    var duration: Tick
+    var zoom: [ZoomKeyframe]         // empty = static full frame
+}
+
+struct StillImage: Codable, Sendable, Equatable {
+    var id: UUID
+    var fileName: String             // stills/<id>.png inside the package
+    var capturedAt: Tick?            // source time it was grabbed from, if any
+    var pixelSize: CGSize
+}
+
+struct ZoomKeyframe: Codable, Sendable, Equatable {
+    var time: Tick                   // relative to segment start
+    var center: CGPoint              // normalised 0…1 in image space
+    var scale: Double                // 1.0 = full frame, 2.0 = 2× zoom
+    var easing: Easing               // easing INTO this keyframe
+}
+
+struct Title: Codable, Sendable, Equatable, Identifiable {
+    var id: UUID
+    var text: String
+    var anchor: TitleAnchor
+    var duration: Tick
+    var styleID: UUID
+    var styleOverrides: StyleOverrides?   // per-title tweaks (position, size)
+    var transitionIn: Transition
+    var transitionOut: Transition
+}
+
+struct TitleAnchor: Codable, Sendable, Equatable {
+    var segmentID: UUID
+    var offset: Tick                 // from segment start
+}
+
+struct Transition: Codable, Sendable, Equatable {
+    var kind: TransitionKind         // .none .fade .slide(edge) .scale .typewriter
+    var duration: Tick
+    var easing: Easing
+}
+
+enum Easing: String, Codable, Sendable { case linear, easeIn, easeOut, easeInOut }
+
+struct TitleStyle: Codable, Sendable, Equatable, Identifiable {
+    var id: UUID
+    var name: String
+    var fontName: String
+    var fontSizeRatio: Double        // fraction of output height (resolution-independent)
+    var weight: FontWeight
+    var textColor: RGBA
+    var background: BackgroundBox?   // colour, padding, corner radius
+    var shadow: Shadow?
+    var stroke: Stroke?
+    var alignment: TextAlignment
+    var position: NormalizedPosition // preset (lowerThird, center, top…) or custom x/y
+    var maxWidthRatio: Double        // wrap width as fraction of output width
+}
+
+struct OutputSettings: Codable, Sendable, Equatable {
+    var size: CGSize                 // default = source naturalSize
+    var frameRate: Double            // default = source
+    var codec: Codec                 // .h264 / .hevc
+}
+```
+
+## 4.1 Why titles anchor to segments
+
+A title placed at absolute output time 0:12 would drift onto the wrong
+content when a still is inserted before it. Anchoring to `(segmentID,
+offset)` keeps it on its content. When a segment is split, titles anchored to
+it are re-anchored to whichever half contains their start. When a segment is
+deleted, its titles are deleted with it (undoable).
+
+::: {.callout-important}
+This is a design decision for the user to confirm — see §13, D1.
+:::
+
+## 4.2 Timeline math (`TimelineMath`)
+
+Pure functions, fully unit tested:
+
+- `outputDuration(project)`
+- `segmentStart(id) -> Tick` (output time)
+- `locate(outputTime) -> (segmentID, offsetInSegment)`
+- `sourceTime(outputTime) -> Tick?` (nil inside a still)
+- `titleOutputRange(title) -> TickRange`
+- `split(segmentID, at offset) -> (Segment, Segment)`
+- Clamping: titles may extend past their segment end into following
+  segments; they are clamped only to total output duration.
+
+## 4.3 Stills
+
+- Grab: `AVAssetImageGenerator` with `requestedTimeToleranceBefore/After =
+  .zero`, `appliesPreferredTrackTransform = true`, at the current *source*
+  time. Saved as PNG into the package `stills/` folder.
+- Grab is only valid while the playhead is inside a video segment.
+- Insert: splits the current video segment at the playhead and inserts the
+  still segment between the halves. Default duration 3 s (configurable).
+- Still segments can also be dragged to another position in the timeline.
+
+## 4.4 Zoom keyframes
+
+- Evaluated per frame: find surrounding keyframes, interpolate `center` and
+  `scale` with the later keyframe's easing.
+- Before the first keyframe: hold first value. After the last: hold last.
+- With zero keyframes: full frame, scale 1.
+- The visible rect is clamped so it never leaves the image (no black edges).
+- The `ZoomKeyframe` type is segment-agnostic so video segments can use it
+  later without a model change.
+
+# 5. Persistence
+
+## 5.1 Project file
+
+A document package `MyEdit.titlecut/` (directory shown as one file in Finder):
+
+```
+MyEdit.titlecut/
+  project.json
+  stills/
+    <uuid>.png
+```
+
+- Implemented with SwiftUI `DocumentGroup` + `FileDocument`/`ReferenceFileDocument`
+  using `FileWrapper` for the package.
+- The source video is **referenced**, not copied (videos are large). Stored as
+  a bookmark plus last known path. If the file is missing on open, show a
+  relink dialog.
+- `formatVersion` checked on load; unknown higher version refuses to open
+  with a clear message.
+- Autosave via the document system.
+
+## 5.2 Style library
+
+- App-wide presets in `~/Library/Application Support/TitleCut/styles.json`.
+- Ships with a built-in set (e.g. Lower Third, Centered Bold, Caption,
+  Chapter Card, Minimal).
+- When a style is applied to a title, the style is copied into
+  `Project.styles` so the project renders identically on another machine or
+  after the library changes.
+- Editing a project style offers "update in library too".
+- Built 2026-10-14: a title's customised copy of a library style records
+  it (`TitleStyle.basedOn`). CUSTOMISE then offers UPDATE <NAME>, which
+  writes the look over the library style and gives it to every title on that
+  style in this project; other projects keep their embedded copies.
+  Right-clicking a tile in the STYLES panel renames a style, deletes a saved
+  one, or reverts a changed built-in.
+
+# 6. Rendering
+
+## 6.1 Composition build
+
+`CompositionBuilder.build(project) -> (AVMutableComposition, AVMutableVideoComposition)`
+
+- One video composition track, one audio composition track.
+- Video segment → `insertTimeRange(sourceRange, of: sourceTrack, at: cursor)`.
+- Still segment → `insertEmptyTimeRange(...)` on both tracks; the compositor
+  produces the frame itself.
+- One `TitleCutInstruction` (conforming to `AVVideoCompositionInstructionProtocol`)
+  per segment, covering that segment's output range. Each instruction carries
+  an immutable snapshot of what is needed to draw it: segment kind, still image
+  reference, zoom keyframes, the titles overlapping its range, the styles.
+- `videoComposition.customVideoCompositorClass = TitleCutCompositor.self`.
+- Render size and frame duration from `OutputSettings`.
+- Source preferred transform (rotated phone video) applied in the compositor.
+
+## 6.2 Compositor (`TitleCutCompositor`)
+
+- Implements `AVVideoCompositing`. Runs on its own serial queue.
+- For each request: read the instruction, get the source frame (video
+  segments) or the cached still `CIImage` (still segments), hand both to
+  `FrameRenderer`, render into a pixel buffer from the render context pool.
+- A shared `CIContext` (Metal-backed) for the life of the compositor.
+- Still images decoded once and cached by `stillID`.
+- `cancelAllPendingVideoCompositionRequests` honoured (scrubbing generates many).
+
+## 6.3 FrameRenderer
+
+`render(base: CIImage, at outputTime, context) -> CIImage`
+
+1. Base: source frame with preferred transform, scaled/letterboxed to output
+   size; or still with zoom rect cropped and scaled to output size.
+2. Titles active at this time, in order of start time:
+   - Text laid out with Core Text into a `CGImage` (cached per title + style
+     + render size; cache invalidates on any change).
+   - Transition evaluated → opacity, offset, scale, character count
+     (typewriter).
+   - Composited over the base with `CIFilter.sourceOverCompositing` after an
+     affine transform.
+3. Pure enough to call outside AVFoundation — used by tests and by the MCP
+   `render_frame` tool.
+
+## 6.4 Audio during stills
+
+Stills insert silence: the source audio pauses with the video and resumes
+after. (Alternative in §13, D3.)
+
+## 6.5 Preview
+
+- `AVPlayer` with an `AVPlayerItem` built from the composition +
+  video composition. Rebuilt when the model changes, preserving playhead time
+  and play state.
+- Scrubbing: `seek(to:toleranceBefore:.zero, toleranceAfter:.zero)` while
+  dragging, with coalescing (only the latest pending seek is issued).
+- Frame step: `AVPlayerItem.step(byCount:)`.
+
+# 7. UI
+
+## 7.1 Window layout
+
+```
+┌──────────────────────────────────────────────┬──────────────┐
+│                                              │              │
+│               Preview                        │  Inspector   │
+│        (click a title to select it)          │  (selected   │
+│                                              │   item)      │
+├──────────────────────────────────────────────┤              │
+│ ◀◀ ▶ ▶▶   00:01:12:05 / 00:03:40:00   [scrub] │              │
+├──────────────────────────────────────────────┴──────────────┤
+│ Titles   ▭▭▭▭     ▭▭▭        ▭▭▭▭▭▭                         │
+│ Segments ███████████|▒▒still▒▒|██████████████████            │
+│                     ▲ playhead                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## 7.2 Actions and shortcuts
+
+| Action | Shortcut | Notes |
+|---|---|---|
+| Play / pause | Space | |
+| Frame back / forward | ← / → | |
+| 1 s back / forward | ⇧← / ⇧→ | |
+| Add title at playhead | T | uses current default style |
+| Grab still | S | only inside a video segment |
+| Insert grabbed still at playhead | ⇧S | |
+| Split segment at playhead | ⌘K | |
+| Add zoom keyframe at playhead | Z | only inside a still segment |
+| Delete selection | ⌫ | |
+| Undo / redo | ⌘Z / ⇧⌘Z | |
+| Export | ⌘E | |
+
+## 7.3 Timeline
+
+- Segment track: video segments as solid blocks with thumbnail strip
+  (generated lazily via `AVAssetImageGenerator`), stills as image-filled
+  blocks.
+- Title track: one lane; overlapping titles stack into extra lanes
+  automatically.
+- Drag title body = move (re-anchors on drop). Drag title edges = duration.
+- Drag still block edges = duration. Drag still block = reorder.
+- Click anywhere = move playhead. Zoom timeline with pinch / ⌘+ ⌘−.
+- Implemented as a SwiftUI `Canvas` for drawing plus gesture handling; drop to
+  an `NSView` only if gesture handling proves inadequate.
+
+## 7.4 Inspector
+
+- **Title:** text field (multi-line), style picker (thumbnails), duration,
+  in/out transition pickers with duration and easing, position override.
+- **Still segment:** duration, zoom keyframe list, "add keyframe at
+  playhead", per-keyframe centre (drag a reticle on the preview) and scale.
+- **Video segment:** source in/out (read-only timecodes), split, delete.
+
+## 7.5 Styles
+
+- Style picker shows live thumbnails rendered by `TitleRenderer`.
+- "Default style for new titles" setting — the "pre-pick" case.
+- Changing a title's style afterwards re-renders immediately — the
+  "pick after" case.
+- Multi-select titles → apply style to all.
+
+# 8. Undo
+
+- `ProjectStore` holds `project: Project` and an `UndoManager`.
+- `perform(_ command: ProjectCommand)` snapshots the old value, applies, and
+  registers an undo action restoring the snapshot, named for the menu
+  ("Undo Add Title").
+- Continuous gestures (dragging a title) coalesce into one undo step via
+  `beginGesture` / `endGesture`.
+- MCP commands go through `perform` too, so ⌘Z undoes Claude's edits.
+
+# 9. Export
+
+- `AVAssetExportSession` with the built composition and video composition.
+- Presets: H.264 or HEVC at output size. Output `.mp4`.
+- Uses the modern async `export(to:as:)` API with progress observation.
+- Export sheet: destination, codec, progress bar, cancel.
+- On failure: show what failed and what to do (the user started it, so it may
+  speak). No messages for background work.
+
+# 10. MCP integration
+
+## 10.1 Transport
+
+Claude Code must reach a server living inside a running GUI app. Two options:
+
+- **A — Stdio bridge (recommended).** A small command-line tool
+  `titlecut-mcp`, built in the same project and embedded in the app bundle
+  (`TitleCut.app/Contents/MacOS/titlecut-mcp`). Claude Code launches it via
+  stdio (`StdioTransport` from the Swift SDK — confirmed supported). It
+  forwards each tool call to the running app over a Unix domain socket at
+  `~/Library/Application Support/TitleCut/mcp.sock`. If the app is not
+  running, tools return "TitleCut is not running. Open it and retry."
+  Registration: `claude mcp add titlecut -- /Applications/TitleCut.app/Contents/MacOS/titlecut-mcp`
+- **B — In-app HTTP server.** Only if the Swift SDK ships a server-side HTTP
+  transport. Not confirmed — a search found only `HTTPClientTransport`.
+  Verify in `Sources/MCP` before choosing.
+
+::: {.callout-important}
+Transport choice is for the user to confirm — see §13, D4.
+:::
+
+## 10.2 Gate
+
+Per the standing MCP rule: a `get_instructions()` tool returns the full
+description, tool list and an example workflow, and sets a flag. Every other
+tool returns
+`"Call get_instructions() first to initialize this MCP server before using any other tools."`
+until it has been called. The flag lives in the bridge process (resets with
+each Claude Code session).
+
+## 10.3 Tools
+
+All times in tools are seconds (Double) for readability; converted to
+`Tick` at the boundary. All IDs are UUID strings.
+
+| Tool | Purpose |
+|---|---|
+| `get_instructions` | gate + documentation |
+| `get_project` | source info, output duration, segments, titles, styles (JSON) |
+| `open_video(path)` | start a new project from a video |
+| `get_playhead` / `seek(seconds)` | read / move the playhead |
+| `list_segments` | ordered segments with output start/end |
+| `split_segment(at_seconds)` | split at an output time |
+| `delete_segment(id)` | |
+| `grab_still(at_seconds)` | capture source frame → still ID |
+| `insert_still(still_id, at_seconds, duration)` | insert still block |
+| `set_segment_duration(id, seconds)` | stills only |
+| `add_zoom_keyframe(segment_id, at, center_x, center_y, scale, easing)` | |
+| `remove_zoom_keyframe(segment_id, index)` | |
+| `list_titles` | with resolved output times |
+| `add_title(text, at_seconds, duration, style?, in?, out?)` | |
+| `update_title(id, fields…)` | partial update |
+| `delete_title(id)` | |
+| `list_styles` / `set_title_style(title_ids, style)` | |
+| `render_frame(at_seconds)` | PNG of the composed frame, so Claude can see the result |
+| `export(path, codec)` / `export_status` | start export, poll progress |
+| `undo` / `redo` | |
+
+Every mutating tool calls the same `ProjectStore` command the UI uses, on the
+main actor, and returns the changed entity as JSON.
+
+::: {.callout-note}
+MCP scope (agreed 2026-10-14). Everything the UI can do is a tool. The table
+above is superseded by this list.
+
+- Transport (revised 2026-10-14): the app serves MCP Streamable HTTP at
+  `http://127.0.0.1:PORT/mcp` (SDK `StatefulHTTPServerTransport`, one MCP
+  session per Claude Code session, gate per session). This Mac only, and
+  with "Require key" on, every request must carry the key as
+  `Authorization: Bearer <key>` (kept in the login keychain; New key in the
+  panel replaces it). The switch is saved. **It defaults to off for now, while
+  debug builds re-sign on every build; turn the default on before release.** The instructions
+  also go out in the initialize handshake. An MCP button right of Export
+  turns it on: grey off, green listening; off the first time, then as it
+  was at quit. The port is remembered (default 7340); if taken, the next free
+  one is used and the panel says so. The panel shows the key, the
+  `claude mcp add --transport http … --header` command and the address. The
+  stdio helper is removed. The app must be open.
+- Target: the front project window by default. `list_projects` names the open
+  projects; every tool takes an optional `project` to pick another.
+- Each tool call is one undo step, named as the UI names it, so ⌘Z undoes it.
+
+Tools, by area:
+
+- Session: `get_instructions` (gate), `list_projects`, `get_project`,
+  `undo`, `redo`, `save`.
+- `get_project` is the full snapshot, as JSON: source file (path, length,
+  size, frame rate, audio or not), shape and output length, playhead,
+  selection, saved state, what Undo and Redo would do; every clip with output
+  and source times, framing, and freeze camera; every title with resolved
+  times, text and full look; every music piece; whether a transcript exists;
+  export progress.
+- Video and shape: `open_video(path)`, `set_shape(16:9 | 9:16 | 1:1 |
+  original)`, `get_playhead`, `seek(seconds)`, `play`, `pause`.
+- Clips: `list_segments`, `split_at(seconds)`, `delete_segment`,
+  `move_segment(id, to_seconds)`, `trim_segment(id, start, end)` (source
+  range), `set_framing(id, framing?, y?, zoom?)`, `set_split(id, split?,
+  first?, second?, first_y?, first_zoom?, second_y?, second_zoom?)`, `freeze_frame(at_seconds, duration)`,
+  `set_freeze_length(id, seconds)`, `set_camera(id, center_x, center_y,
+  scale, pace)`, `reset_camera(id)`.
+- Titles: `list_titles`, `add_title(text, at, duration?, style?)`,
+  `update_title(id, text?, start?, duration?, position?, size?, look…,
+  transition_in?, transition_out?)`, `delete_titles(ids)`,
+  `duplicate_titles(ids)`, `set_titles_style(ids, style)`, `list_styles`.
+- Captions: `auto_captions(language?, style?)` (runs transcription, reports
+  progress), `get_transcript` (words with times), `list_captions`,
+  `export_subtitles(path)`.
+- Silences: `find_silences(quieter_than_db, longer_than_seconds)` (dry run:
+  count, seconds removed, the ranges), `remove_silences(same settings)`.
+- Music: `add_music(path, at?)`, `list_music`, `update_music(id, start?,
+  song_start?, duration?, volume?, fade_in?, fade_out?)`, `delete_music`,
+  `duplicate_music`.
+- Output: `render_frame(at_seconds)` (PNG, so Claude can see the result),
+  `export(path, codec, subtitles?)`, `export_status`.
+:::
+
+# 11. Testing
+
+## 11.1 Unit tests (TitleCutCore)
+
+- `TimelineMath`: locate, split, title re-anchoring on split/delete,
+  output duration, boundary cases (time exactly on a segment edge).
+- Zoom interpolation: before/between/after keyframes, each easing, clamping
+  the visible rect inside the image.
+- Transition evaluation: opacity/offset at start, mid, end of in and out;
+  titles shorter than in+out durations (transitions scaled down, never
+  overlap).
+- Codable round trip of `Project`; refusal of a higher `formatVersion`.
+- Undo: every command undoes to an `Equatable`-identical project.
+
+## 11.2 Render tests
+
+- Fixture video generated at test time with `AVAssetWriter`: 5 s, 640×360,
+  30 fps, each frame a solid colour that encodes its frame number. No binary
+  fixtures committed.
+- Build composition for a known project, pull frames with
+  `AVAssetImageGenerator` using the video composition, assert:
+  - correct source frame appears at the right output time after a still,
+  - still segment frame matches the grabbed image,
+  - a title pixel region is non-background while active and background
+    outside its range.
+- Export test: export the fixture project, assert output duration equals
+  `TimelineMath.outputDuration`.
+
+## 11.3 MCP tests
+
+- Gate: every tool except `get_instructions` returns the gate message first.
+- Each tool against an in-memory `ProjectStore`: mutation result and undo.
+
+# 12. Milestones
+
+Each milestone ends with tests passing and the app runnable. The user QAs
+before the next starts.
+
+| # | Milestone | Done when |
+|---|---|---|
+| M0 | Scaffold | `project.yml`, app + `TitleCutCore` + tests + `titlecut-mcp` targets, builds and runs an empty window |
+| M1 | Open and scrub | open video, preview, play/pause, scrub, frame step, timecode |
+| M2 | Model and timeline | `Project` model, `TimelineMath`, segment track, split, delete, undo, save/load package |
+| M3 | Compositor | custom compositor drives preview; video segments render identically to M1 |
+| M4 | Titles | add/move/resize titles, inspector, built-in styles, all transitions, preview |
+| M5 | Stills | grab, insert, duration, reorder, audio silence during stills |
+| M6 | Zoom | keyframes, inspector, reticle on preview, easing |
+| M7 | Export | export sheet, progress, cancel, render/export tests |
+| M8 | MCP | bridge, socket, gate, all tools, `render_frame` |
+| M9 | Polish | thumbnails strip, style editor, relink missing video, shortcuts audit |
+
+::: {.callout-important}
+Scope change (2026-10-08): v1 is titles-only. Build order after M3 is
+M4, M7, M8, M9. M5 (Stills) and M6 (Zoom) are deferred past v1.
+:::
+
+::: {.callout-note}
+Trim (added 2026-10-13, built alongside M7). Every video segment is a range
+of the whole source, so its edges can be dragged in (trim) or out (reveal
+hidden source), never past the source's start or end.
+
+- Ripple: a segment's length change shifts every later segment; no gaps, no
+  overlaps.
+- Titles stick to the footage: extending or trimming the left edge by `d`
+  changes their anchor offset by `d`, so they stay on the same source frame.
+- A title whose start would fall outside the trimmed segment is clamped to
+  the segment's nearest edge.
+- One command, `trimSegment`; an edge drag is one undo step.
+:::
+
+::: {.callout-note}
+Moving clips and gaps (agreed 2026-10-13). Supersedes "always ripple" above.
+
+- New segment kind `gap` (a duration, no media): renders black with silence.
+  Encoded as `{"gap":{...}}`; formatVersion stays 1 (nothing shipped yet).
+- Dragging a clip body moves it. Titles anchored to it move with it.
+- Dropping onto another clip inserts it there and pushes later clips right;
+  nothing ever overlaps. Space it leaves behind becomes a gap.
+- Trimming an edge first eats into or opens the adjacent gap; it pushes later
+  clips only when no gap is left. Adjacent gaps merge; a trailing gap is
+  dropped.
+- Magnetic snapping while dragging a clip or an edge: clip edges, the
+  playhead and the timeline start, within a few points on screen.
+- Titles can anchor to a gap (e.g. an intro title over black).
+- Each drag is one undo step.
+- Changed 2026-10-15, Final Cut style: lifting a clip closes up its place
+  (moves never leave a gap), and the drop is measured on the timeline
+  without it. On another clip it goes in at the nearer edge and later clips
+  slide right live; in a gap it takes that place; past the end it is
+  appended.
+:::
+
+::: {.callout-note}
+Transcription (agreed 2026-10-13, after M8). On-device speech-to-text with
+word timings (macOS 26 speech APIs; no cloud, no key). Uses: auto-captions
+(each phrase becomes a timed title), and a transcript exposed through the MCP
+bridge so Claude can propose titles, chapter cards and silence cuts. Details
+to be planned when M8 is done.
+
+Auto-captions (brought forward, agreed 2026-10-13):
+
+- The transcript is saved in the package as `transcript.json` (source-time
+  words with start/end), so transcription runs once per source.
+- Captions are short lines: up to about 7 words / 42 characters / 3 s, broken
+  at pauses and sentence ends. Only speech inside kept segments becomes
+  captions, anchored to the segment it falls in.
+- Titles made by auto-captions carry a marker. Running it again replaces the
+  marked titles (one undo step); hand-made titles are untouched.
+
+Word highlight and SRT (agreed 2026-10-14):
+
+- Auto-captions store their words with times relative to the title start
+  (optional field on Title). Styles get an optional highlight (on/off,
+  colour). The spoken word changes to the highlight colour.
+- SRT export contains the auto-captions as they are on the timeline, at
+  output times. Export sheet checkbox "Also save subtitles (.srt)" and
+  File > Export Subtitles….
+
+Ideas to review:
+
+- Transitions between clips (added to the to-do list 2026-10-14, after MCP):
+  crossfade or dip to black at a cut. Built 2026-10-14: dips, fades and
+  crossfades at cuts, the start and the end, without changing the video's
+  length.
+- Mass edit of transitions (backlog, nice to have, 2026-10-14): change the
+  kind or length of many transitions at once, or put one at every cut.
+- Filler-word removal (backlog, 2026-10-15): find "um", "uh" and similar in
+  the transcript and cut them, with a dry run like find_silences. Built
+  2026-10-15 (`FillerRemoval`): sounds only (um, uh, er, ah, hmm and
+  variants), never words such as "like". Timeline > Remove Filler Words…
+  uses the saved transcript, or transcribes only when the person presses
+  Transcribe (shared with Auto-Captions as `Transcription`). Auto-captions
+  are rebuilt in the same undo step. MCP: find_fillers, remove_fillers.
+- Face reframing (backlog, 2026-10-15): track the speaker's face and keep it
+  framed when the output shape is narrower than the source, such as 9:16.
+  Built 2026-10-15 as Frame Faces (`FaceFraming`): the largest face is
+  sampled every 0.25 s (at most 400 frames a clip). Where it settles more
+  than a quarter of the frame's width away for 1 s or longer, the clip is
+  split there; each part is framed on the median position. One undo step.
+  Clips without a face keep theirs. FRAME FACES under the framing map,
+  Timeline > Frame Faces, MCP frame_faces. A framing that pans with the
+  face was not chosen.
+- Title cards (built 2026-10-15): a segment kind `card` (`CardSegment`:
+  length, solid colour, transitions), silent, for titles on a plain
+  background. Not a gap: gaps are empty space that trims eat, merge and drop
+  at the end. Inserted black and 3 s long at the playhead (+ > Card,
+  Timeline > Insert Title Card), without a title; at a cut it takes the cut's
+  transition, inside a clip it splits it. The inspector sets its colour and
+  length; its ends drag like a freeze's. MCP: insert_card, set_card. Later:
+  an image background.
+- Animated GIF export (built 2026-10-16, `GIFExporter`): a Format chip
+  (MP4 / GIF) in the Export sheet. GIF options: Loop Forever / Once, width
+  320 / 480 / 720 px (height follows the shape), 10 / 15 / 24 fps. Whole
+  video, no sound, same frames and watermark as MP4, written with ImageIO.
+  MCP export takes format (default from the extension), loop, gif_width,
+  gif_fps. File > Export… and the Export button replace "Export MP4".
+- Clip speed and volume (built 2026-10-16): `VideoSegment.speed` (0.5,
+  0.75, 1, 1.25, 1.5, 2; `nil` is 1) and `volume` (0...2; `nil` is 1), absent
+  from older files. Speed sets the clip's timeline length; source time maps
+  through `sourceOffset(atOutput:)` / `outputOffset(ofSource:)` in splits,
+  trims, captions, silences, fillers, Frame Faces, crossfade handles and the
+  waveform. Speech keeps its pitch (spectral). Titles on a clip keep their
+  footage when its speed changes; auto-captions also scale their length and
+  words. Selecting a video clip shows the CLIP inspector (speed chips,
+  volume slider with Mute). MCP: set_clip; get_project shows speed, volume.
+- More videos on one timeline (built 2026-10-18): Add Video puts a whole
+  video at the end as one clip, on the same single track, to split, trim
+  and move like any clip. `Project.addedSources` holds the videos after the
+  first, each with an ID; `VideoSegment.sourceID` names a clip's video
+  (`nil` is `Project.source`), absent from older files. A file already in
+  the project is reused; a video no clip plays is removed. The first video
+  sets the output size and frame rate; others fill the frame, cropped, with
+  framing as usual. One composition track takes every clip from its own
+  file. Transcripts are kept per video in `transcripts.json` (older
+  packages' `transcript.json` is read); captions, silences, fillers and
+  Frame Faces work per clip's video. A missing video shows Video Not Found
+  with Locate Video for that file. Entry points: File > Add Video…
+  (Option-Command-O), + > Video at End…, dropping a file on the timeline,
+  MCP add_video; get_project lists added_videos and each clip's video.
+- Split screen (built 2026-10-19): a video clip can show two parts of its
+  picture at once, each filling half the frame, e.g. an interviewer on top
+  and the guest below in 9:16. `VideoSegment.split` (`SplitScreen`: `first`
+  and `second` framings, 0...1 like `framing`), absent from older files;
+  `framing` is unused while it is set. Since 2026-10-22 each half is a
+  `ClipFraming` (x, y, zoom) and boxes zoom 1-6x (1-3x until 2026-10-23); see below. The halves are equal: stacked in a
+  frame at least as tall as wide (first on top), side by side in a wider
+  one (first on the left). CLIP inspector > Screen:
+  WHOLE / SPLIT (starts at 0.25 and 0.75); the framing map shows boxes 1
+  and 2 to drag; Command-dragging the preview moves the half pressed. Both
+  parts of a cut keep it. Freeze Frame joins both halves into the still.
+  Frame Faces leaves split clips alone. MCP: set_split; get_project shows
+  split.
+  Zoom and vertical framing (built 2026-10-22): boxes zoom 1-6x through
+  corner handles in the framing map and move in x and y, for whole clips and
+  split halves (`ClipFraming`: x, y, zoom; `VideoSegment.framingY` and `zoom`,
+  absent from older files; older split files with numbers load as x).
+  Command-drag moves in 2D. Frame Faces sets x only and accounts for zoom.
+  MCP: set_framing gains y and zoom; set_split gains first_y, first_zoom,
+  second_y, second_zoom; get_project shows framing_y, zoom and split halves
+  as objects.
+  Timeline: a split clip shows a dashed line between its halves and a
+  "Split" tag (2026-10-23).
+  Built and removed 2026-10-23: a half showing another video (per-segment
+  feeds meant cutting at every switch), and a half holding a frame while
+  the other plays (one clock per clip, so a paused half cannot resume
+  where it stopped; the halves drift apart).
+- Generated music (not chosen, 2026-10-16): an optional ElevenLabs or Gemini
+  key to make background music in the app. Skipped as duplication: people
+  with a key can generate a track there and use Add Music, and over MCP
+  Claude can pair the provider's own MCP server with add_music. MusicGen
+  on device was ruled out by its non-commercial weights licence.
+- AI frame image (backlog, 2026-10-15): send a frame and a prompt to an
+  image model (OpenAI or Google Gemini; Claude does not make images) with
+  the person's own API key, and insert the result as a freeze at that frame.
+
+- Live caption strip: while the video plays, the words being spoken show as
+  a caption. Clicking a word, or selecting a run of words, makes a title from
+  them, timed to when they are spoken.
+- Signing (decided 2026-10-14): Debug builds are signed with the Apple
+  Development certificate (set in an uncommitted Config/Local.xcconfig), so the code identity survives
+  rebuilds and macOS keeps the Open Recent list. Release stays ad-hoc until
+  the purchasing work moves it to the App Sandbox.
+:::
+
+::: {.callout-note}
+Paid unlock (agreed 2026-10-14, purchasing not built yet). The app is a free
+download. Exports carry a large see-through "TitleCut" wordmark across the
+middle of every frame (`Watermark`, built). A one-time purchase of about
+$2.99 removes it.
+
+- StoreKit 2, one non-consumable in-app purchase, plus Restore Purchases.
+- Unlocked means `Transaction.currentEntitlements` holds a `.verified`
+  transaction for that product (signed by Apple, checked on the Mac). Nothing
+  is cached in user defaults or the project.
+- The check runs at export time and feeds `Exporter.export(watermark:)`.
+  Built 2026-10-14 (`App/Purchase/Unlock.swift`): product
+  `com.byteclub.titlecut.unlock`, bought or restored from the export sheet;
+  MCP exports use the same check. Local testing uses
+  `StoreKit/TitleCut.storekit`, which applies only when run from Xcode.
+- The wordmark is drawn inside the export render, not as a separate layer.
+- Requires Mac App Store distribution and the App Sandbox, which reverses D5
+  (unsandboxed, ad-hoc). Source access then needs security-scoped bookmarks.
+- Sandbox built 2026-10-14 (`App/TitleCut.entitlements`): user-selected
+  files, security-scoped bookmarks, network server. Source videos are
+  bookmarked with security scope; a project whose video the app may not open
+  shows Video Not Found with Locate Video. MCP tools use paths only inside
+  folders the person allows (MCP panel > Folders, `MCPFolders`), and
+  inside ~/Movies and ~/Music, which the entitlements grant. The .srt
+  beside an export is written as a related item. Debug builds from Xcode get
+  an injected read-only exception for `/`, so reading is not sandboxed there;
+  `CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO` builds without it.
+:::
+
+::: {.callout-note}
+Full title customisation (agreed 2026-10-13, phase two, with the M9 style
+editor). Font, size, weight, text colour, background box, shadow, outline,
+alignment and wrap width, editable in the right-hand panel and savable as a
+style. `TitleStyle` already stores all of these.
+:::
+
+# 13. Open decisions for the user
+
+Defaults below are what the plan assumes. Confirm or change before the
+relevant milestone.
+
+| ID | Decision | Default in this plan | Alternative |
+|---|---|---|---|
+| D1 | Title anchoring | anchored to segment + offset (§4.1) | absolute output time |
+| D2 | Title renderer | Core Image inside the custom compositor, one path for preview and export (§6) | Core Animation layers (`AVVideoCompositionCoreAnimationTool` for export, `AVSynchronizedLayer` for preview). This was the earlier proposal; it gives two code paths and does not cover stills/zoom. |
+| D3 | Audio during stills | silence; source audio resumes after | source audio keeps playing under the still (video and audio drift apart) |
+| D4 | MCP transport | **In-app HTTP on 127.0.0.1 (decided 2026-10-14, replacing the stdio bridge built the same day)** | stdio bridge + Unix socket |
+| D5 | Sandboxing / distribution | unsandboxed, local build only (sandbox complicates the socket and bookmarks) | App Sandbox + Developer ID / App Store |
+| D6 | Source video storage | referenced by bookmark | copied into the package |
+| D7 | Min macOS | 26.0 | 15.0 for wider reach |
+| D8 | About screen / DEV-PROD build split (the iOS project convention) | not included | add an About window with version and build date |
+| D9 | Release script / CI | none (macOS, local use) | `scripts/release.sh` per the iOS convention |
+
+::: {.callout-note}
+TODO (D9, 2026-10-07): no release script for now. Revisit adding
+`scripts/release.sh` later.
+:::

@@ -1,0 +1,6 @@
+// Debug: the defaults, then your own signing from Config/Local.xcconfig if
+// it exists (not committed). Example Local.xcconfig:
+//   CODE_SIGN_IDENTITY = Apple Development
+//   DEVELOPMENT_TEAM = <your team ID>
+#include "Signing.xcconfig"
+#include? "Local.xcconfig"
