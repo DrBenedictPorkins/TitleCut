@@ -10,7 +10,7 @@ A native macOS app that adds timed titles, captions, freeze frames and camera mo
 
 ![Export sheet with size options and file-size estimates](docs/screenshots/export.png)
 
-![MCP panel showing the address, key and allowed folders](docs/screenshots/mcp.png)
+![MCP panel showing the Claude Code setup command and server address](docs/screenshots/mcp.png)
 
 ## Features
 
