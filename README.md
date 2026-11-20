@@ -2,6 +2,10 @@
 
 A native macOS app that adds timed titles, captions, freeze frames and camera moves to a video and exports it to MP4 or GIF.
 
+## Demo
+
+[docs/demo.mp4](docs/demo.mp4): 20 seconds. Claude Code adds a title over MCP while the video plays with auto-captions.
+
 ## Screenshots
 
 ![Editor: preview, timeline and inspector](docs/screenshots/editor.png)
