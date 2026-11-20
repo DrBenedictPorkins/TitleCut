@@ -4,7 +4,11 @@ A native macOS app that adds timed titles, captions, freeze frames and camera mo
 
 ## Demo
 
-[docs/demo.mp4](docs/demo.mp4): 43 seconds of Claude Code editing a video over MCP: auto-captions, a styled title, Remove Silences with its preview, 9:16 with face framing, a freeze zoom, music, and the Export sheet.
+[docs/demo.mp4](docs/demo.mp4) (35 s): one request typed into Claude Code, then Claude driving TitleCut over MCP. It cuts the pauses, adds captions, frames the speaker's face for 9:16, adds a title and music, and exports. The run took 1 min 45 s with no hand edits; the video shows it at 6x speed.
+
+[docs/result-short.mp4](docs/result-short.mp4) (21.6 s, 720 x 1280): the finished vertical short from that run.
+
+Footage: NASA, "Connecting Classrooms to Space: Ham Radio Explainer". NASA does not endorse this project.
 
 ## Screenshots
 
