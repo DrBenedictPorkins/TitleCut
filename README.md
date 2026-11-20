@@ -4,7 +4,9 @@ A native macOS app that adds timed titles, captions, freeze frames and camera mo
 
 ## Demo
 
-[docs/demo.mp4](docs/demo.mp4): 43 seconds of Claude Code editing a video over MCP: auto-captions, a styled title, Remove Silences with its preview, 9:16 with face framing, a freeze zoom, music, and the Export sheet.
+![TitleCut demo: Claude Code editing a video over MCP](docs/demo.gif)
+
+43 seconds of Claude Code editing a video over MCP: auto-captions, a styled title, Remove Silences with its preview, 9:16 with face framing, a freeze zoom, music, and the Export sheet. Full-quality version: [docs/demo.mp4](docs/demo.mp4).
 
 ## Screenshots
 
